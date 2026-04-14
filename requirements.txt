@@ -4,3 +4,7 @@ pandas
 openpyxl
 python-docx
 python-dotenv
+sentence-transformers
+torch
+numpy
+scikit-learn
