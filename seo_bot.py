@@ -16,6 +16,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from storage_db import StorageDB
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +45,7 @@ load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 PIXEL_TOOLS_KEY = os.getenv("PIXEL_TOOLS_KEY")
-USE_MOCK = os.getenv("USE_MOCK", "False").lower() in ("true", "1", "yes")
+USE_MOCK = os.getenv("USE_MOCK", "0") == "1"
 
 if not TG_TOKEN or not OPENROUTER_API_KEY:
     logger.error("TG_TOKEN или OPENROUTER_API_KEY не найдены. Установите их в .env файле.")
@@ -103,6 +105,8 @@ class OpenRouterChat:
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
+
+DB = StorageDB()
 
 class SeoProcess(StatesGroup):
     waiting_for_file = State()
@@ -266,11 +270,23 @@ async def process_excel_file(message: Message, state: FSMContext):
 
         keys = df['Фраза'].astype(str).tolist()
         ws_values = df['WS'].tolist()
-        USER_DATA[user_id] = {'keys': keys}
+        
+        project_id = str(message.from_user.id)
+
+        DB.add_keywords(project_id, keys, ws_values)
+        USER_DATA[user_id] = {
+        'keys': keys,
+        'project_id': str(user_id)
+        }
+
 
         await status_msg.edit_text("🔍 Парсим конкурентов...")
         top_urls = await get_top_competitors(keys)
+
+        DB.add_competitors(project_id, top_urls)
+
         
+
         await status_msg.edit_text("🧠 Генерирую структуру...")
         keys_str = "\n".join([f"- {k} ({w})" for k, w in zip(keys, ws_values)])
         prompt = f"Рассчитай оптимальный объем текста и составь SEO-структуру (H1, H2).\nКлючи:\n{keys_str}"
@@ -314,7 +330,12 @@ async def step0_callback(call: CallbackQuery, state: FSMContext):
 async def step1_callback(call: CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
     chat = USER_CHATS.get(user_id)
-    if not chat: return await call.message.edit_text("❌ Сессия устарела.")
+
+    project_id = USER_DATA.get(user_id, {}).get('project_id')
+
+    if not chat: 
+        return await call.message.edit_text("❌ Сессия устарела.")
+    
     await call.message.edit_reply_markup(reply_markup=None)
 
     status_msg = await call.message.answer("✍️ Генерирую текст по блокам... ⏳")
@@ -337,6 +358,8 @@ async def step1_callback(call: CallbackQuery, state: FSMContext):
             await status_msg.edit_text(f"✍️ Генерация: блок {i+1} из {len(blocks)} ({block_name})... ⏳")
             block_prompt = f"Напиши текст строго для блока: '{block_name}'. Учитывай наше ТЗ. Органично используй эти LLSI слова: {', '.join(lsi_words)}."
             block_resp = await safe_llm_request(chat, block_prompt)
+
+            DB.add_text(project_id, block_name, block_resp.text)
             
             density = calculate_block_density(block_resp.text, lsi_words)
             USER_DATA[user_id]['analytics'].append(f"Блок '{block_name}': Плотность LLSI = {density:.1f}%")
