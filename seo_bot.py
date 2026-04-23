@@ -1,4 +1,4 @@
-﻿import os
+import os
 import io
 import json
 import logging
@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import pandas as pd
 from docx import Document
 
+from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.filters import CommandStart, Command
@@ -31,7 +32,6 @@ logger = logging.getLogger(__name__)
 try:
     from sentence_transformers import SentenceTransformer, util
     logger.info("Загрузка модели sentence-transformers...")
-    # Using all-MiniLM-L6-v2 as requested/standard
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     logger.info("Модель успешно загружена.")
 except ImportError:
@@ -70,7 +70,7 @@ class OpenRouterChat:
             if "составь SEO-структуру" in content:
                 ans = "Структура статьи:\n\nX1. Введение\nX2. Основная часть\n- Блок А\n- Блок Б\nX3. Заключение"
             elif "Техническое Задание" in content:
-                ans = "ТЗ:\nLLSI слова: пример, тема, тест, текст, структура\nОбъем: 2000 сим."
+                ans = "ТЗ:\nLSI слова: пример, тема, тест, текст, структура\nОбъем: 2000 сим."
             elif "Выпиши как JSON массив" in content:
                 ans = '["X1. Введение", "X2. Основная часть", "X3. Заключение"]'
             elif "Напиши текст строго для блока:" in content:
@@ -199,12 +199,53 @@ async def get_top_competitors(keys):
                 break
         return []
 
+async def fetch_html_via_curl(url: str, user_agent: str = "Googlebot/2.1 (+http://www.google.com/bot.html)") -> str:
+    """Запускает системный cURL для скачивания HTML страницы с подменой User-Agent."""
+    if USE_MOCK:
+        logger.info(f"MOCK cURL: Возвращаем тестовый HTML для {url}")
+        await asyncio.sleep(1)
+        return "<html><h1>Mock H1</h1><h2>Mock H2</h2><p>Mock text</p></html>"
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'curl', '-s', '-k', '-L', '--max-time', '10', '-A', user_agent, url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            return stdout.decode('utf-8', errors='ignore')
+        else:
+            logger.warning(f"Ошибка cURL ({process.returncode}) для {url}: {stderr.decode('utf-8', errors='ignore')}")
+            return ""
+    except Exception as e:
+        logger.error(f"Сбой при запуске cURL для {url}: {e}")
+        return ""
+
+def extract_structure_from_html(html: str) -> str:
+    """Извлекает H1, H2, H3 заголовки из HTML-кода через BeautifulSoup."""
+    if not html: return ""
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        headers = soup.find_all(['h1', 'h2', 'h3'])
+        structure = []
+        for tag in headers:
+            text = tag.get_text(separator=" ", strip=True)
+            if not text: continue
+            if tag.name == 'h1': prefix = "# "
+            elif tag.name == 'h2': prefix = "## "
+            else: prefix = "### "
+            structure.append(prefix + text)
+        return "\n".join(structure)
+    except Exception as e:
+        logger.error(f"Ошибка парсинга bs4: {e}")
+        return ""
+
 def calculate_block_density(text: str, lsi_words: list):
-    """Оценка плотности LSI слов через эмбеддинги (семантическое сходство) и физическое вхождение."""
+    """Оценка плотности LSI слов через эмбеддинги и физическое вхождение."""
     if not lsi_words:
         return 0.0
     
-    # 1. Считаем физическую плотность
     words_in_text = text.lower().split()
     total_words = len(words_in_text)
     if total_words == 0: return 0.0
@@ -212,24 +253,22 @@ def calculate_block_density(text: str, lsi_words: list):
     found_count = sum(1 for w in lsi_words if w.lower() in text.lower())
     density_percent = (found_count / max(1, len(lsi_words))) * 100
 
-    # 2. Оценка структуры/семантическая плотность (если загружена модель)
     if embedding_model:
         lsi_text = " ".join(lsi_words)
         lsi_emb = embedding_model.encode(lsi_text)
         text_emb = embedding_model.encode(text)
         similarity = util.cos_sim(lsi_emb, text_emb).item() * 100
-        # Итоговая комбинированная плотность по блокам - микс прямого вхождения и семантики
         return (density_percent + max(0, similarity)) / 2
 
     return density_percent
 
 def extract_lsi_words(tz_text: str):
-    """Извлекает SI-слова из сгенерированного ТЗ, анализируя текст."""
-    match = re.search(r'LLSI слова:(.*?)(?:\n|$)', tz_text, re.IGNORECASE)
+    """Извлекает LSI-слова из сгенерированного ТЗ."""
+    match = re.search(r'LSI слова:(.*?)(?:\n|$)', tz_text, re.IGNORECASE)
     if match:
         words = match.group(1).split(',')
         return [w.strip() for w in words if w.strip()]
-    return ["анализ", "качество", "услуга"] # Fallback
+    return ["анализ", "качество", "услуга"]
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -268,14 +307,37 @@ async def process_excel_file(message: Message, state: FSMContext):
         ws_values = df['WS'].tolist()
         USER_DATA[user_id] = {'keys': keys}
 
-        await status_msg.edit_text("🔍 Парсим конкурентов...")
+        await status_msg.edit_text("🔍 Парсим конкурентов (Pixel Plus)...")
         top_urls = await get_top_competitors(keys)
         
-        await status_msg.edit_text("🧠 Генерирую структуру...")
-        keys_str = "\n".join([f"- {k} ({w})" for k, w in zip(keys, ws_values)])
-        prompt = f"Рассчитай оптимальный объем текста и составь SEO-структуру (H1, H2).\nКлючи:\n{keys_str}"
+        # --- NEW CODE FOR CURL ---
+        competitors_structures = ""
         if top_urls:
-            prompt += f"\nURL конкурентов:\n" + "\n".join(top_urls[:5])
+            urls_to_parse = top_urls[:5] # Топ-5 для того чтобы не превысить лимиты
+            await status_msg.edit_text("🕵️ Парсим структуры конкурентов (cURL Googlebot)...")
+            
+            tasks = [fetch_html_via_curl(u) for u in urls_to_parse]
+            html_results = await asyncio.gather(*tasks)
+            
+            structures = []
+            for url, html in zip(urls_to_parse, html_results):
+                struct = extract_structure_from_html(html)
+                if struct:
+                    structures.append(f"Структура сайта {url}:\n{struct}")
+            
+            if structures:
+                competitors_structures = "\n\n".join(structures)
+                logger.info(f"Сформированы структуры конкурентов (длина={len(competitors_structures)})")
+        # --- END NEW CODE ---
+        
+        await status_msg.edit_text("🧠 Генерирую SEO-структуру...")
+        keys_str = "\n".join([f"- {k} ({w})" for k, w in zip(keys, ws_values)])
+        prompt = f"Рассчитай оптимальный объем текста и составь идеальную SEO-структуру (H1, H2, H3).\nКлючи:\n{keys_str}"
+        
+        if competitors_structures:
+            prompt += f"\n\nИспользуй как основу реальные структуры конкурентов из ТОП-5 (H1-H3):\n{competitors_structures}"
+        elif top_urls:
+            prompt += f"\n\nURL конкурентов (для справки, cURL не удался):\n" + "\n".join(top_urls[:5])
 
         chat = get_or_create_chat(user_id)
         response = await safe_llm_request(chat, prompt)
@@ -301,7 +363,7 @@ async def step0_callback(call: CallbackQuery, state: FSMContext):
     
     status_msg = await call.message.answer("📝 Формирую ТЗ...")
     try:
-        prompt = "Составь ТЗ по шаблону:\n- Требования к блокам\n- LLSI слова\n- Объем"
+        prompt = "Составь ТЗ по шаблону:\n- Требования к блокам\n- LSI слова\n- Объем"
         response = await safe_llm_request(chat, prompt)
         USER_DATA[user_id]['tz'] = response.text
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Дальше", callback_data="step1_continue")]])
@@ -319,7 +381,6 @@ async def step1_callback(call: CallbackQuery, state: FSMContext):
 
     status_msg = await call.message.answer("✍️ Генерирую текст по блокам... ⏳")
     try:
-        # Извлекаем список блоков из ТЗ
         prompt_blocks = "Выпиши как JSON массив список всех подзаголовков (блоков) из ТЗ, для которых нужно написать текст. Просто массив строк, без markdown."
         blocks_resp = await safe_llm_request(chat, prompt_blocks)
         blocks_text = blocks_resp.text.replace("```json", "").replace("```", "").strip()
@@ -332,14 +393,13 @@ async def step1_callback(call: CallbackQuery, state: FSMContext):
         USER_DATA[user_id]['analytics'] = []
         full_text = ""
 
-        # Поблочная генерация с подсчетом плотности SI
         for i, block_name in enumerate(blocks):
             await status_msg.edit_text(f"✍️ Генерация: блок {i+1} из {len(blocks)} ({block_name})... ⏳")
-            block_prompt = f"Напиши текст строго для блока: '{block_name}'. Учитывай наше ТЗ. Органично используй эти LLSI слова: {', '.join(lsi_words)}."
+            block_prompt = f"Напиши текст строго для блока: '{block_name}'. Учитывай наше ТЗ. Органично используй эти LSI слова: {', '.join(lsi_words)}."
             block_resp = await safe_llm_request(chat, block_prompt)
             
             density = calculate_block_density(block_resp.text, lsi_words)
-            USER_DATA[user_id]['analytics'].append(f"Блок '{block_name}': Плотность LLSI = {density:.1f}%")
+            USER_DATA[user_id]['analytics'].append(f"Блок '{block_name}': Плотность LSI = {density:.1f}%")
             
             full_text += f"\n\n### {block_name}\n\n{block_resp.text}"
 
@@ -359,7 +419,7 @@ async def step2_callback(call: CallbackQuery, state: FSMContext):
     if not USER_CHATS.get(user_id): return await call.message.edit_text("❌ Сессия устарела.")
     await call.message.edit_reply_markup(reply_markup=None)
 
-    status_msg = await call.message.answer("📄 Формирую Word-документ (с отчетом по SI)...")
+    status_msg = await call.message.answer("📄 Формирую Word-документ (с отчетом по LSI)...")
     try:
         data = USER_DATA.get(user_id, {})
         tz_content = data.get('tz', '')
@@ -368,7 +428,7 @@ async def step2_callback(call: CallbackQuery, state: FSMContext):
         
         doc = Document()
         doc.add_heading("Аналитика и скоринг", level=1)
-        doc.add_paragraph("Оценка плотности LSI слов (комбинация частотности и семантики):")
+        doc.add_paragraph("Оценка плотности LSI слов:")
         for an in analytics:
             doc.add_paragraph(an)
 
@@ -402,4 +462,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот остановлен.")
-
